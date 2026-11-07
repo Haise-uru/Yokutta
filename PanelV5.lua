@@ -12,7 +12,8 @@ local ALLOWED = {
 	[1884221246] = true,   -- друг 1
 	[1508151580] = true, 
     [3027495927] = true,
-    [352395] = true  -- друг 2
+    [352395] = true,
+	[11562911574] = true -- друг 2
 }
 
 if not ALLOWED[Players.LocalPlayer.UserId] then
