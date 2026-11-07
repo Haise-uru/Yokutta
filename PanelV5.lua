@@ -3046,8 +3046,8 @@ do
 			FlowName = "Speedster", -- значение Flow, при котором применяется бонус (регистр не важен)
 			BurstAndFlow = 9.1, -- SpeedBurst + Flow
 			FlowOnly = 4.55, -- только Flow
-			BurstOnly = 4.9, -- только SpeedBurst
-			Clicking = 2, -- зажата M1
+			BurstOnly = 4.55, -- только SpeedBurst
+			Clicking = 1.5, -- зажата M1
 			Idle = 1, -- обычное состояние
 		}
 
