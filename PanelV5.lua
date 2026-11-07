@@ -2419,7 +2419,242 @@ do
 	--------------------------------------------------------
 	-- ДВИЖОК ПЕРЕВОДА
 	--------------------------------------------------------
-	local function translate(text, lang)
+	-- ===== Резервный автоперевод =====
+	-- Если строки нет в DICT/PFX/PAT, она переводится онлайн (Google Translate) и кэшируется
+	-- (в памяти + в файле Yokatta_translations.json). Числа маскируются ({1}, {2}…),
+	-- поэтому динамические строки вроде «Пинг 45 мс» переводятся один раз, а не на каждое значение.
+	-- Нужна поддержка HTTP в executor (request / http_request / syn.request); без неё остаётся русский.
+	local MT = {}
+	do
+		local MT_LANG = { en = "en", zh = "zh-CN", ja = "ja", ko = "ko", es = "es", fr = "fr", de = "de", pt = "pt", it = "it" }
+		local MT_FILE = "Yokatta_translations.json"
+		local MT_LIMIT = 2500 -- максимум онлайн-запросов за сессию (защита от спама)
+		local MT_WORKERS = 3
+		local httpReq = (syn and syn.request) or (http and http.request) or http_request or request
+
+		local cache = {}
+		for code in pairs(MT_LANG) do
+			cache[code] = {}
+		end
+		if isfile and readfile and isfile(MT_FILE) then
+			local ok, data = pcall(function()
+				return HttpService:JSONDecode(readfile(MT_FILE))
+			end)
+			if ok and type(data) == "table" then
+				for code, map in pairs(data) do
+					if cache[code] and type(map) == "table" then
+						cache[code] = map
+					end
+				end
+			end
+		end
+
+		local dirty = false
+		if writefile then
+			task.spawn(function()
+				while Gui.Parent do
+					task.wait(5)
+					if dirty then
+						dirty = false
+						pcall(function()
+							writefile(MT_FILE, HttpService:JSONEncode(cache))
+						end)
+					end
+				end
+			end)
+		end
+
+		-- числа заменяются на токены 99101, 99102… (цифры переводчики не трогают), потом возвращаются
+		local function mask(text)
+			local nums = {}
+			local masked = text:gsub("%-?%d+[%.,]?%d*", function(n)
+				nums[#nums + 1] = n
+				return tostring(99100 + #nums)
+			end)
+			return masked, nums
+		end
+
+		local function unmask(text, nums)
+			for i = 1, #nums do
+				if not text:find(tostring(99100 + i), 1, true) then
+					return nil
+				end
+			end
+			return (text:gsub("%f[%d]99%d%d%d%f[%D]", function(t)
+				return nums[tonumber(t) - 99100]
+			end))
+		end
+
+		local warned = {}
+		local function warnOnce(msg)
+			if not warned[msg] then
+				warned[msg] = true
+				warn("[Yokatta] автоперевод: " .. msg)
+			end
+		end
+
+		local ENDPOINTS = {
+			"https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=ru&tl=%s",
+			"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=ru&tl=%s",
+		}
+
+		local function parse(body)
+			local ok, data = pcall(function()
+				return HttpService:JSONDecode(body)
+			end)
+			if not ok or type(data) ~= "table" then
+				return nil
+			end
+			local out = {}
+			if type(data[1]) == "table" then
+				for _, seg in ipairs(data[1]) do
+					if type(seg) == "table" and type(seg[1]) == "string" then
+						out[#out + 1] = seg[1]
+					end
+				end
+			elseif type(data.sentences) == "table" then
+				for _, sn in ipairs(data.sentences) do
+					if type(sn) == "table" and type(sn.trans) == "string" then
+						out[#out + 1] = sn.trans
+					end
+				end
+			end
+			if #out == 0 then
+				return nil
+			end
+			return table.concat(out)
+		end
+
+		local function fetch(text, lang)
+			local q = HttpService:UrlEncode(text)
+			local lastErr = "?"
+			for _, ep in ipairs(ENDPOINTS) do
+				local url = string.format(ep, MT_LANG[lang])
+				local req
+				if #q > 1500 then
+					req = {
+						Url = url,
+						Method = "POST",
+						Headers = { ["Content-Type"] = "application/x-www-form-urlencoded" },
+						Body = "q=" .. q,
+					}
+				else
+					req = { Url = url .. "&q=" .. q, Method = "GET" }
+				end
+				local ok, res = pcall(httpReq, req)
+				if not ok then
+					lastErr = tostring(res)
+				elseif type(res) ~= "table" then
+					lastErr = "пустой ответ"
+				elseif res.StatusCode ~= 200 and res.Success ~= true then
+					lastErr = "HTTP " .. tostring(res.StatusCode)
+				else
+					local r = parse(res.Body)
+					if r then
+						return r
+					end
+					lastErr = "не удалось разобрать ответ"
+				end
+			end
+			warnOnce("запрос не удался (" .. lastErr .. ")")
+			return nil
+		end
+
+		local queue, waiting, failed = {}, {}, {}
+		local active, used = 0, 0
+		MT.Resync = function() end -- подставляется ниже (sync)
+
+		local function pump()
+			while active < MT_WORKERS and #queue > 0 do
+				local job = table.remove(queue, 1)
+				active += 1
+				task.spawn(function()
+					local res = fetch(job.masked, job.lang)
+					if not res then
+						job.tries = (job.tries or 0) + 1
+						if job.tries < 4 then
+							-- возможно лимит запросов: ждём и пробуем снова
+							task.wait(1.5 * job.tries)
+							queue[#queue + 1] = job
+							active -= 1
+							pump()
+							return
+						end
+						failed[job.key] = true
+					else
+						cache[job.lang][job.masked] = res
+						dirty = true
+					end
+					local set = waiting[job.key]
+					waiting[job.key] = nil
+					if res and set and Look.Lang == job.lang then
+						for inst in pairs(set) do
+							if inst.Parent then
+								MT.Resync(inst)
+							end
+						end
+					end
+					task.wait(0.12) -- небольшая пауза между запросами
+					active -= 1
+					pump()
+				end)
+			end
+		end
+
+		function MT.ClearFailed()
+			failed = {}
+		end
+
+		-- возвращает перевод из кэша или исходный текст (и ставит строку в очередь на перевод)
+		function MT.Lookup(text, lang, inst)
+			local map = cache[lang]
+			if not map or not text:find("[\208\209]") then
+				return text
+			end
+			if not httpReq then
+				warnOnce("в этом executor нет request/http_request, поэтому строки вне словаря остаются русскими")
+				return text
+			end
+			if text:find("</?%a[^>]*>") then
+				return text -- RichText-теги не отдаём переводчику
+			end
+			local masked, nums = mask(text)
+			local hit = map[masked]
+			if hit then
+				local r = unmask(hit, nums)
+				if r then
+					return r
+				end
+				-- числа потерялись при переводе: переводим строку целиком, вместе с числами
+				masked, nums = text, {}
+				hit = map[masked]
+				if hit then
+					return hit
+				end
+			end
+			local key = lang .. "|" .. masked
+			if failed[key] then
+				return text
+			end
+			local set = waiting[key]
+			if not set then
+				if used >= MT_LIMIT then
+					return text
+				end
+				used += 1
+				set = setmetatable({}, { __mode = "k" })
+				waiting[key] = set
+				queue[#queue + 1] = { key = key, lang = lang, masked = masked }
+				pump()
+			end
+			if inst then
+				set[inst] = true
+			end
+			return text
+		end
+	end
+
+	local function translate(text, lang, inst)
 		if lang == "ru" or text == "" then
 			return text
 		end
@@ -2432,7 +2667,7 @@ do
 			local k = p.key
 			if text:sub(1, #k) == k then
 				local rest = text:sub(#k + 1)
-				return (p[lang] or k) .. (d[rest] or rest)
+				return (p[lang] or k) .. (d[rest] or MT.Lookup(rest, lang, inst))
 			end
 		end
 		for _, p in ipairs(PAT) do
@@ -2441,7 +2676,7 @@ do
 				return string.format(p[lang], table.unpack(caps))
 			end
 		end
-		return text
+		return MT.Lookup(text, lang, inst)
 	end
 
 	-- оригинал хранится в атрибуте YKOrig, последний наш перевод — в YKTr
@@ -2452,12 +2687,13 @@ do
 			orig = cur
 			inst:SetAttribute("YKOrig", orig)
 		end
-		local new = translate(orig, Look.Lang)
+		local new = translate(orig, Look.Lang, inst)
 		inst:SetAttribute("YKTr", new)
 		if new ~= cur then
 			inst.Text = new
 		end
 	end
+	MT.Resync = sync
 
 	local hooked = setmetatable({}, { __mode = "k" })
 	local function hook(inst)
@@ -2475,20 +2711,48 @@ do
 		end
 	end
 
-	for _, inst in ipairs(Gui:GetDescendants()) do
-		hook(inst)
+	-- переводим ВСЕ окна Yokatta (панель, курсор, уведомления, HUD-виджеты авто-функций), а не только главное
+	local roots = setmetatable({}, { __mode = "k" })
+	local function addRoot(g)
+		if not g or roots[g] then
+			return
+		end
+		roots[g] = true
+		for _, inst in ipairs(g:GetDescendants()) do
+			hook(inst)
+		end
+		g.DescendantAdded:Connect(hook)
 	end
-	Gui.DescendantAdded:Connect(hook)
+	local function isOurs(g)
+		return g:IsA("ScreenGui") and string.sub(g.Name, 1, 7) == "Yokatta"
+	end
+	addRoot(Gui)
+	addRoot(CursorGui)
+	for _, g in ipairs(parent:GetChildren()) do
+		if isOurs(g) then
+			addRoot(g)
+		end
+	end
+	parent.ChildAdded:Connect(function(g)
+		if isOurs(g) then
+			addRoot(g)
+		end
+	end)
 
 	function Look.SetLang(code)
 		if not DICT[code] or code == Look.Lang then
 			return
 		end
 		Look.Lang = code
-		for _, inst in ipairs(Gui:GetDescendants()) do
-			if inst:IsA("TextLabel") or inst:IsA("TextButton") then
-				hook(inst)
-				sync(inst)
+		MT.ClearFailed()
+		for g in pairs(roots) do
+			if g.Parent then
+				for _, inst in ipairs(g:GetDescendants()) do
+					if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+						hook(inst)
+						sync(inst)
+					end
+				end
 			end
 		end
 		if Look.OnLang then
@@ -3678,6 +3942,7 @@ do
 			LO.Target = nil
 			LO.Pinned = false
 			if not LO.Enabled then
+				LO.Yaw = nil
 				releaseFacing()
 			end
 			refreshGui()
@@ -3710,6 +3975,7 @@ do
 
 		RunService.Heartbeat:Connect(function(dt)
 			if not LO.Enabled then
+				LO.Yaw = nil
 				return
 			end
 
@@ -3717,6 +3983,7 @@ do
 			local root = char and char:FindFirstChild("HumanoidRootPart")
 			local hum = char and char:FindFirstChildOfClass("Humanoid")
 			if not root or not hum then
+				LO.Yaw = nil
 				releaseFacing()
 				return
 			end
@@ -3736,6 +4003,7 @@ do
 			end
 
 			-- поворот персонажа
+			LO.Yaw = nil
 			local tp = LO.Target and getPos(LO.Target)
 			if tp and LO.FaceChar then
 				local d = Vector3.new(tp.X - root.Position.X, 0, tp.Z - root.Position.Z)
@@ -3760,6 +4028,10 @@ do
 						yaw = cornerYaw(yaw, yawOf(look.X, look.Z), hb.size)
 					end
 					facing.align.CFrame = CFrame.Angles(0, yaw, 0)
+					-- Shift Lock / игра каждый кадр разворачивают персонажа по камере и перебивают
+					-- AlignOrientation, поэтому угол ещё и задаём напрямую (здесь и после камеры)
+					LO.Yaw = yaw
+					root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, yaw, 0)
 
 					if hum.AutoRotate then
 						hum.AutoRotate = false
@@ -3788,6 +4060,13 @@ do
 			RunService:UnbindFromRenderStep("YokattaLockOnCam")
 		end)
 		RunService:BindToRenderStep("YokattaLockOnCam", Enum.RenderPriority.Camera.Value + 1, function()
+			if LO.Enabled and LO.FaceChar and LO.Yaw then
+				local ch = LocalPlayer.Character
+				local r = ch and ch:FindFirstChild("HumanoidRootPart")
+				if r then
+					r.CFrame = CFrame.new(r.Position) * CFrame.Angles(0, LO.Yaw, 0)
+				end
+			end
 			if not (LO.Enabled and LO.FaceCam and LO.Target) then
 				return
 			end
